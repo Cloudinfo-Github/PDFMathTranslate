@@ -172,3 +172,11 @@ cython_debug/
 uv.lock
 *.pdf
 *.docx
+
+# Claude Code
+.claude/
+
+# Temporary files
+_ul
+*.tmp
+*.temp
