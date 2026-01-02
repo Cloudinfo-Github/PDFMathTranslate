@@ -176,7 +176,42 @@ uv.lock
 # Claude Code
 .claude/
 
-# Temporary files
+# VS Code / GitHub Copilot phantom files
+# Reference: https://github.com/microsoft/vscode/issues/261079
+# Reference: https://github.com/microsoft/vscode-copilot-release/issues/12738
 _ul
 *.tmp
 *.temp
+*.bak
+*.swp
+*.swo
+*~
+
+# Empty/phantom files with strange names
+\[
+\]
+\(
+\)
+
+# VS Code cache files
+*.crswap
+*.code-workspace
+
+# C++ extension temp files
+cpp.hint
+cpp.stop
+
+# Common IDE temp patterns
+*.cache
+*.log
+!important.log
+
+# Copilot/AI generated temp files
+.copilot/
+.github-copilot/
+.aider*
+
+# Crash dumps and core files
+*.stackdump
+core
+core.*
