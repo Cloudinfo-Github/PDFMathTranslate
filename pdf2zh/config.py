@@ -212,3 +212,13 @@ class ConfigManager:
         instance = cls.get_instance()
         with instance._lock:
             os.remove(instance._config_path)
+
+    @classmethod
+    def get_language(cls, default="English"):
+        """获取保存的语言偏好设置"""
+        return cls.get("PDF2ZH_LANGUAGE", default)
+
+    @classmethod
+    def set_language(cls, language):
+        """保存语言偏好设置"""
+        cls.set("PDF2ZH_LANGUAGE", language)

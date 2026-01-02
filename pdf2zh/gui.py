@@ -18,6 +18,7 @@ from pdf2zh import __version__
 from pdf2zh.high_level import translate
 from pdf2zh.doclayout import ModelInstance
 from pdf2zh.config import ConfigManager
+from pdf2zh.i18n import I18nManager, get_i18n_manager, set_language
 from pdf2zh.translator import (
     AnythingLLMTranslator,
     AzureOpenAITranslator,
@@ -50,6 +51,19 @@ from babeldoc import __version__ as babeldoc_version
 logger = logging.getLogger(__name__)
 
 BABELDOC_MODEL = OnnxModel.load_available()
+
+# Initialize i18n manager
+# Get saved language preference from config, default to Traditional Chinese
+saved_language = ConfigManager.get_language("繁體中文 (Traditional Chinese)")
+i18n_manager = get_i18n_manager(saved_language)
+set_language(saved_language)
+
+
+def t(key: str, default: str = "") -> str:
+    """Shortcut function for translation"""
+    return i18n_manager.translate(key, default)
+
+
 # The following variables associate strings with translators
 service_map: dict[str, BaseTranslator] = {
     "Google": GoogleTranslator,
@@ -90,6 +104,24 @@ lang_map = {
     "Spanish": "es",
     "Italian": "it",
 }
+
+# i18n display keys for language names (values remain stable internal tokens)
+lang_ui_key_map = {
+    "English": "lang_english",
+    "Simplified Chinese": "lang_simplified_chinese",
+    "Traditional Chinese": "lang_traditional_chinese",
+    "French": "lang_french",
+    "German": "lang_german",
+    "Japanese": "lang_japanese",
+    "Korean": "lang_korean",
+    "Russian": "lang_russian",
+    "Spanish": "lang_spanish",
+    "Italian": "lang_italian",
+}
+
+
+def get_lang_choices() -> list[tuple[str, str]]:
+    return [(t(lang_ui_key_map[name]), name) for name in lang_map.keys()]
 
 # The following variable associate strings with page ranges
 page_map = {
@@ -210,6 +242,8 @@ def translate_file(
     threads,
     skip_subset_fonts,
     ignore_cache,
+    translate_table_text,
+    no_watermark,
     vfont,
     use_babeldoc,
     recaptcha_response,
@@ -249,20 +283,20 @@ def translate_file(
     cancellation_event_map[session_id] = asyncio.Event()
     # Translate PDF content using selected service.
     if flag_demo and not verify_recaptcha(recaptcha_response):
-        raise gr.Error("reCAPTCHA fail")
+        raise gr.Error(t("error_recaptcha_fail"))
 
-    progress(0, desc="Starting translation...")
+    progress(0, desc=t("progress_starting"))
 
     output = Path("pdf2zh_files")
     output.mkdir(parents=True, exist_ok=True)
 
     if file_type == "File":
         if not file_input:
-            raise gr.Error("No input")
+            raise gr.Error(t("error_no_input"))
         file_path = shutil.copy(file_input, output)
     else:
         if not link_input:
-            raise gr.Error("No input")
+            raise gr.Error(t("error_no_input"))
         file_path = download_with_limit(
             link_input,
             output,
@@ -298,6 +332,8 @@ def translate_file(
                 translator, k, None
             )
             _envs[k] = real_keys
+    # Persist latest env values for this translator so they survive reloads
+    ConfigManager.set_translator_by_name(translator.name, _envs)
 
     print(f"Files before translation: {os.listdir(output)}")
 
@@ -326,7 +362,9 @@ def translate_file(
         "prompt": Template(prompt) if prompt else None,
         "skip_subset_fonts": skip_subset_fonts,
         "ignore_cache": ignore_cache,
-        "vfont": vfont,  # 添加自定义公式字体正则表达式
+        "translate_table_text": translate_table_text,
+        "no_watermark": no_watermark,
+        "vfont": vfont,
         "model": ModelInstance.value,
     }
 
@@ -359,7 +397,21 @@ def babeldoc_translate_file(**kwargs):
 
     babeldoc_init()
     from babeldoc.high_level import async_translate as babeldoc_translate
-    from babeldoc.translation_config import TranslationConfig as YadtConfig
+    from babeldoc.translation_config import TranslationConfig as YadtConfig, WatermarkOutputMode
+    
+    # Import RapidOCRModel for table text translation
+    table_model = None
+    if kwargs.get("translate_table_text", False):
+        try:
+            from babeldoc.docvision.table_detection.rapidocr import RapidOCRModel
+            table_model = RapidOCRModel()
+            logger.info("Table text translation enabled with RapidOCR")
+        except ImportError as e:
+            logger.warning(f"RapidOCR not installed. Install with: pip install rapidocr_onnxruntime")
+            logger.warning(f"Table text translation disabled. Error: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to load RapidOCRModel: {e}")
+            logger.warning("Table text translation disabled due to initialization error")
 
     for translator in [
         GoogleTranslator,
@@ -403,6 +455,9 @@ def babeldoc_translate_file(**kwargs):
 
     for file in kwargs["files"]:
         file = file.strip("\"'")
+        # Determine watermark output mode
+        watermark_mode = WatermarkOutputMode.NoWatermark if kwargs.get("no_watermark", True) else WatermarkOutputMode.Watermarked
+
         yadt_config = YadtConfig(
             input_file=file,
             font=None,
@@ -420,10 +475,17 @@ def babeldoc_translate_file(**kwargs):
             disable_rich_text_translate=not isinstance(translator, OpenAITranslator),
             skip_clean=kwargs["skip_subset_fonts"],
             report_interval=0.5,
+            table_model=table_model,
+            watermark_output_mode=watermark_mode,
         )
 
         async def yadt_translate_coro(yadt_config):
             progress_context, progress_handler = create_progress_handler(yadt_config)
+
+            # Initialize variables to track translation result
+            file_mono = None
+            file_dual = None
+            translate_error = None
 
             # 开始翻译
             with progress_context:
@@ -435,6 +497,10 @@ def babeldoc_translate_file(**kwargs):
                     if kwargs["cancellation_event"].is_set():
                         yadt_config.cancel_translation()
                         raise CancelledError
+                    if event["type"] == "translate_error":
+                        # Capture translation error
+                        translate_error = event.get("message", "Unknown translation error")
+                        logger.error(f"Translation error: {translate_error}")
                     if event["type"] == "finish":
                         result = event["translate_result"]
                         logger.info("Translation Result:")
@@ -448,6 +514,13 @@ def babeldoc_translate_file(**kwargs):
             import gc
 
             gc.collect()
+
+            # Check if translation was successful
+            if file_mono is None or file_dual is None:
+                error_msg = translate_error or t("error_translation_failed")
+                logger.error(f"Translation failed: {error_msg}")
+                raise gr.Error(f"{t('error_translation_failed')}: {error_msg}")
+
             return (
                 str(file_mono),
                 str(file_mono),
@@ -476,27 +549,148 @@ custom_blue = gr.themes.Color(
 )
 
 custom_css = """
-    .secondary-text {color: #999 !important;}
+    /* Hide footer and set base background */
     footer {visibility: hidden}
-    .env-warning {color: #dd5500 !important;}
-    .env-success {color: #559900 !important;}
-
-    /* Add dashed border to input-file class */
-    .input-file {
-        border: 1.2px dashed #165DFF !important;
-        border-radius: 6px !important;
+    body, .gradio-container {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        background: #f6f7fb;
+        min-height: 100vh;
     }
 
-    .progress-bar-wrap {
-        border-radius: 8px !important;
-    }
-
-    .progress-bar {
-        border-radius: 8px !important;
-    }
-
-    .pdf-canvas canvas {
+    .gradio-container {
+        max-width: 1600px;
         width: 100%;
+        margin: 1rem auto;
+        padding: 0 1.5rem 2.5rem;
+    }
+    @media (min-width: 1400px) {
+        .gradio-container { max-width: 90vw; }
+    }
+    .gradio-container .prose { max-width: none; }
+
+    /* Subtle text */
+    .secondary-text { color: #6b7280 !important; font-size: 0.9rem; }
+    .env-warning { color: #d97706 !important; font-weight: 600; }
+    .env-success { color: #16a34a !important; font-weight: 600; }
+
+    /* Header */
+    .app-header { text-align: center; padding: 1rem 0 0.5rem; }
+    .app-header h1, .app-header h2 {
+        font-size: 1.9rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0.25rem 0 0.5rem;
+    }
+
+    /* Top controls */
+    .top-controls { margin: 0 0 0.75rem 0; }
+
+    /* Cards */
+    .panel {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 1.25rem 1.25rem 1.1rem;
+        box-shadow: 0 8px 30px rgba(15, 23, 42, 0.06);
+    }
+    .panel .prose h2 {
+        font-size: 1.2rem;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0 0 0.75rem 0;
+    }
+    .panel .prose h4 {
+        font-size: 1rem;
+        font-weight: 600;
+        color: #111827;
+        margin: 0.75rem 0 0.5rem 0;
+    }
+    .panel-left { border-left: none; }
+    .panel-right { border-left: none; }
+
+    /* Layout */
+    .main-row { gap: 1.25rem; align-items: stretch !important; }
+
+    /* Inputs */
+    .input-file {
+        border: 1.6px dashed #1f7aec !important;
+        border-radius: 10px !important;
+        background: #f8fbff !important;
+        padding: 1.25rem !important;
+    }
+    .input-file:hover { border-color: #0e42d2 !important; background: #f0f5ff !important; }
+
+    .gradio-textbox, .gradio-dropdown, .gradio-radio {
+        border-radius: 10px !important;
+        border: 1px solid #e5e7eb !important;
+        transition: box-shadow 0.15s ease, border-color 0.15s ease !important;
+    }
+    .gradio-textbox:focus, .gradio-dropdown:focus, .gradio-radio:focus {
+        border-color: #1f7aec !important;
+        box-shadow: 0 0 0 3px rgba(31, 122, 236, 0.15) !important;
+    }
+    .gradio-checkbox input[type="checkbox"] { border-radius: 4px !important; cursor: pointer; }
+
+    /* Buttons */
+    .gradio-button {
+        border-radius: 10px !important;
+        font-weight: 700 !important;
+        font-size: 0.95rem !important;
+        padding: 0.7rem 1.2rem !important;
+        letter-spacing: 0.01em;
+        border: none !important;
+        transition: transform 0.12s ease, box-shadow 0.15s ease !important;
+    }
+    .gradio-button:not(.secondary) {
+        background: linear-gradient(135deg, #1f7aec 0%, #0e42d2 100%) !important;
+        color: #ffffff !important;
+    }
+    .gradio-button:not(.secondary):hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 16px rgba(31, 122, 236, 0.25);
+    }
+    .gradio-button.secondary {
+        background: #f3f4f6 !important;
+        color: #111827 !important;
+        border: 1px solid #d1d5db !important;
+    }
+    .gradio-button.secondary:hover {
+        background: #e5e7eb !important;
+    }
+    .action-row { gap: 0.75rem; display: flex; }
+    .action-row button { flex: 1; min-height: 44px; }
+
+    /* Progress */
+    .progress-bar-wrap, .progress-bar {
+        border-radius: 10px !important;
+        overflow: hidden;
+    }
+    .progress-bar { background: linear-gradient(90deg, #1f7aec 0%, #0e42d2 100%) !important; }
+
+    /* Accordion */
+    .gradio-accordion { border-radius: 10px !important; border: 1px solid #e5e7eb !important; overflow: hidden; }
+    .gradio-accordion-header {
+        background: #f8fafc !important;
+        border-bottom: 1px solid #e5e7eb !important;
+        padding: 0.9rem 1rem !important;
+        font-weight: 650 !important;
+        color: #0f172a !important;
+    }
+
+    /* Preview */
+    .pdf-canvas canvas { width: 100%; border-radius: 8px; }
+    .gradio-file { border-radius: 10px !important; background: #f9fafb !important; border: 1px solid #e5e7eb !important; }
+
+    /* Responsive */
+    @media (max-width: 1024px) {
+        .main-row { flex-direction: column; }
+        .panel { padding: 1rem; }
+        .app-header h1, .app-header h2 { font-size: 1.6rem; }
+    }
+    @media (max-width: 640px) {
+        .gradio-container { margin: 1rem auto; padding: 0 0.75rem 1.25rem; }
+        .panel { padding: 0.85rem; border-radius: 10px; }
+        .action-row button { font-size: 0.9rem; padding: 0.55rem 1rem !important; }
     }
     """
 
@@ -512,57 +706,67 @@ demo_recaptcha = """
     """
 
 tech_details_string = f"""
-                    <summary>Technical details</summary>
-                    - GitHub: <a href="https://github.com/Byaidu/PDFMathTranslate">Byaidu/PDFMathTranslate</a><br>
-                    - BabelDOC: <a href="https://github.com/funstory-ai/BabelDOC">funstory-ai/BabelDOC</a><br>
-                    - GUI by: <a href="https://github.com/reycn">Rongxin</a><br>
-                    - pdf2zh Version: {__version__} <br>
-                    - BabelDOC Version: {babeldoc_version}
+                    <summary>{t("tech_details")}</summary>
+                    - {t("tech_details_github")}<br>
+                    - {t("tech_details_babeldoc")}<br>
+                    - {t("tech_details_gui")}<br>
+                    - {t("tech_details_version")} {__version__} <br>
+                    - {t("tech_details_babeldoc_version")} {babeldoc_version}
                 """
 cancellation_event_map = {}
 
 
 # The following code creates the GUI
 with gr.Blocks(
-    title="PDFMathTranslate - PDF Translation with preserved formats",
-    theme=gr.themes.Default(
+    title=t("app_title"),
+    theme=gr.themes.Soft(
         primary_hue=custom_blue, spacing_size="md", radius_size="lg"
     ),
     css=custom_css,
     head=demo_recaptcha if flag_demo else "",
 ) as demo:
-    gr.Markdown(
-        "# [PDFMathTranslate @ GitHub](https://github.com/Byaidu/PDFMathTranslate)"
-    )
+    header_md = gr.Markdown(t("header_github"), elem_classes=["app-header"])
 
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("## File | < 5 MB" if flag_demo else "## File")
+    # Top language selector for quick access
+    with gr.Row(elem_classes=["top-controls"]):
+        language_selector = gr.Dropdown(
+            label=t("language_label"),
+            choices=i18n_manager.get_all_languages(),
+            value=i18n_manager.get_current_language(),
+            scale=1,
+        )
+
+    with gr.Row(elem_classes=["main-row"]):
+        with gr.Column(scale=1, elem_classes=["panel", "panel-left"]):
+            file_section_title = gr.Markdown(
+                t("file_section") if flag_demo else t("file_section_no_limit")
+            )
             file_type = gr.Radio(
-                choices=["File", "Link"],
-                label="Type",
+                # Display is translated, value remains stable for callbacks ("File"/"Link")
+                choices=[(t("type_file"), "File"), (t("type_link"), "Link")],
+                label=t("type_label"),
                 value="File",
             )
             file_input = gr.File(
-                label="File",
+                label=t("file_label"),
                 file_count="single",
                 file_types=[".pdf"],
                 type="filepath",
                 elem_classes=["input-file"],
             )
             link_input = gr.Textbox(
-                label="Link",
+                label=t("link_label"),
                 visible=False,
                 interactive=True,
             )
-            gr.Markdown("## Option")
+            option_section_title = gr.Markdown("## " + t("option_section"))
             service = gr.Dropdown(
-                label="Service",
+                label=t("service_label"),
                 choices=enabled_services,
                 value=enabled_services[0],
             )
             envs = []
-            for i in range(3):
+            for i in range(4):
                 envs.append(
                     gr.Textbox(
                         visible=False,
@@ -571,55 +775,70 @@ with gr.Blocks(
                 )
             with gr.Row():
                 lang_from = gr.Dropdown(
-                    label="Translate from",
-                    choices=lang_map.keys(),
+                    label=t("translate_from_label"),
+                    choices=get_lang_choices(),
                     value=ConfigManager.get("PDF2ZH_LANG_FROM", "English"),
                 )
                 lang_to = gr.Dropdown(
-                    label="Translate to",
-                    choices=lang_map.keys(),
-                    value=ConfigManager.get("PDF2ZH_LANG_TO", "Simplified Chinese"),
+                    label=t("translate_to_label"),
+                    choices=get_lang_choices(),
+                    value=ConfigManager.get("PDF2ZH_LANG_TO", "Traditional Chinese"),
                 )
             page_range = gr.Radio(
-                choices=page_map.keys(),
-                label="Pages",
-                value=list(page_map.keys())[0],
+                # Display is translated, value remains stable for business logic
+                choices=[
+                    (t("page_all"), "All"),
+                    (t("page_first"), "First"),
+                    (t("page_first_5"), "First 5 pages"),
+                    (t("page_others"), "Others"),
+                ],
+                label=t("pages_label"),
+                value="All",
             )
 
             page_input = gr.Textbox(
-                label="Page range",
+                label=t("page_range_label"),
                 visible=False,
                 interactive=True,
             )
 
-            with gr.Accordion("Open for More Experimental Options!", open=False):
-                gr.Markdown("#### Experimental")
+            with gr.Accordion(t("more_options"), open=False) as more_options_acc:
+                experimental_title = gr.Markdown("#### " + t("experimental_label"))
                 threads = gr.Textbox(
-                    label="number of threads", interactive=True, value="4"
+                    label=t("threads_label"), interactive=True, value="6"
                 )
                 skip_subset_fonts = gr.Checkbox(
-                    label="Skip font subsetting", interactive=True, value=False
+                    label=t("skip_fonts_label"), interactive=True, value=True
                 )
                 ignore_cache = gr.Checkbox(
-                    label="Ignore cache", interactive=True, value=False
+                    label=t("ignore_cache_label"), interactive=True, value=False
+                )
+                translate_table_text = gr.Checkbox(
+                    label=t("translate_table_label"), interactive=True, value=False
+                )
+                no_watermark = gr.Checkbox(
+                    label=t("no_watermark_label"), interactive=True, value=True
                 )
                 vfont = gr.Textbox(
-                    label="Custom formula font regex (vfont)",
+                    label=t("vfont_label"),
                     interactive=True,
                     value=ConfigManager.get("PDF2ZH_VFONT", ""),
                 )
                 prompt = gr.Textbox(
-                    label="Custom Prompt for llm", interactive=True, visible=False
+                    label=t("custom_prompt_label"), interactive=True, visible=False
                 )
                 use_babeldoc = gr.Checkbox(
-                    label="Use BabelDOC", interactive=True, value=False
+                    label=t("use_babeldoc_label"), interactive=True, value=True
                 )
                 envs.append(prompt)
+
+            # Track current service for env saving
+            current_service_state = gr.State(value=enabled_services[0])
 
             def on_select_service(service, evt: gr.EventData):
                 translator = service_map[service]
                 _envs = []
-                for i in range(4):
+                for i in range(5):
                     _envs.append(gr.update(visible=False, value=""))
                 for i, env in enumerate(translator.envs.items()):
                     label = env[0]
@@ -643,7 +862,23 @@ with gr.Blocks(
                         value=value,
                     )
                 _envs[-1] = gr.update(visible=translator.CustomPrompt)
-                return _envs
+                # Return envs + updated service state
+                return _envs + [service]
+
+            def save_env_on_change(service_name, env_idx, value):
+                """Save env value to config when user changes it"""
+                if not service_name or service_name not in service_map:
+                    return value
+                translator = service_map[service_name]
+                env_keys = list(translator.envs.keys())
+                if env_idx < len(env_keys):
+                    key = env_keys[env_idx]
+                    # Don't save masked values
+                    if value != "***":
+                        saved_envs = ConfigManager.get_translator_by_name(translator.name) or {}
+                        saved_envs[key] = value
+                        ConfigManager.set_translator_by_name(translator.name, saved_envs)
+                return value
 
             def on_select_filetype(file_type):
                 return (
@@ -661,19 +896,80 @@ with gr.Blocks(
                 ConfigManager.set("PDF2ZH_VFONT", value)
                 return value
 
-            output_title = gr.Markdown("## Translated", visible=False)
+            def on_language_change(language):
+                """Save language preference and update UI"""
+                set_language(language)
+                ConfigManager.set_language(language)
+
+                # Recompute tech details string with new language
+                new_tech_details = f"""
+                    <summary>{t("tech_details")}</summary>
+                    - {t("tech_details_github")}<br>
+                    - {t("tech_details_babeldoc")}<br>
+                    - {t("tech_details_gui")}<br>
+                    - {t("tech_details_version")} {__version__} <br>
+                    - {t("tech_details_babeldoc_version")} {babeldoc_version}
+                """
+
+                # Return updates for key UI components
+                return [
+                    gr.update(value=t("header_github")),  # header_md
+                    gr.update(value=t("file_section") if flag_demo else t("file_section_no_limit")),  # file_section_title
+                    gr.update(
+                        label=t("type_label"),
+                        choices=[(t("type_file"), "File"), (t("type_link"), "Link")],
+                    ),  # file_type
+                    gr.update(value="## " + t("option_section")),  # option_section_title
+                    gr.update(value="#### " + t("experimental_label")),  # experimental_title
+                    gr.update(label=t("service_label")),  # service
+                    gr.update(label=t("translate_from_label"), choices=get_lang_choices()),  # lang_from
+                    gr.update(label=t("translate_to_label"), choices=get_lang_choices()),  # lang_to
+                    gr.update(
+                        label=t("pages_label"),
+                        choices=[
+                            (t("page_all"), "All"),
+                            (t("page_first"), "First"),
+                            (t("page_first_5"), "First 5 pages"),
+                            (t("page_others"), "Others"),
+                        ],
+                    ),  # page_range
+                    gr.update(label=t("page_range_label")),  # page_input
+                    gr.update(label=t("more_options")),  # more_options_acc
+                    gr.update(label=t("threads_label")),  # threads
+                    gr.update(label=t("skip_fonts_label")),  # skip_subset_fonts
+                    gr.update(label=t("ignore_cache_label")),  # ignore_cache
+                    gr.update(label=t("vfont_label")),  # vfont
+                    gr.update(label=t("custom_prompt_label")),  # prompt
+                    gr.update(label=t("use_babeldoc_label")),  # use_babeldoc
+                    gr.update(label=t("file_label")),  # file_input
+                    gr.update(label=t("link_label")),  # link_input
+                    gr.update(value=t("translated_section")),  # output_title
+                    gr.update(label=t("download_mono_label")),  # output_file_mono
+                    gr.update(label=t("download_dual_label")),  # output_file_dual
+                    gr.update(label=t("recaptcha_label")),  # recaptcha_response
+                    gr.update(label=t("language_label"), value=language),  # language_selector
+                    gr.update(value=t("translate_btn")),  # translate_btn
+                    gr.update(value=t("cancel_btn")),  # cancellation_btn
+                    gr.update(value=new_tech_details),  # tech_details_tog
+                    gr.update(value="## " + t("preview_section")),  # preview_section_title
+                    gr.update(label=t("preview_section")),  # preview
+                ]
+
+            output_title = gr.Markdown(t("translated_section"), visible=False)
             output_file_mono = gr.File(
-                label="Download Translation (Mono)", visible=False
+                label=t("download_mono_label"), visible=False
             )
             output_file_dual = gr.File(
-                label="Download Translation (Dual)", visible=False
+                label=t("download_dual_label"), visible=False
             )
             recaptcha_response = gr.Textbox(
-                label="reCAPTCHA Response", elem_id="verify", visible=False
+                label=t("recaptcha_label"), elem_id="verify", visible=False
             )
             recaptcha_box = gr.HTML('<div id="recaptcha-box"></div>')
-            translate_btn = gr.Button("Translate", variant="primary")
-            cancellation_btn = gr.Button("Cancel", variant="secondary")
+
+            with gr.Row(elem_classes=["action-row"]):
+                translate_btn = gr.Button(t("translate_btn"), variant="primary", scale=2)
+                cancellation_btn = gr.Button(t("cancel_btn"), variant="secondary", scale=1)
             tech_details_tog = gr.Markdown(
                 tech_details_string,
                 elem_classes=["secondary-text"],
@@ -682,8 +978,15 @@ with gr.Blocks(
             service.select(
                 on_select_service,
                 service,
-                envs,
+                envs + [current_service_state],
             )
+            # Add change handlers for env inputs to save values immediately
+            for idx, env_input in enumerate(envs[:4]):  # First 4 are the env textboxes
+                env_input.change(
+                    lambda svc, val, i=idx: save_env_on_change(svc, i, val),
+                    inputs=[current_service_state, env_input],
+                    outputs=None,
+                )
             vfont.change(on_vfont_change, inputs=vfont, outputs=None)
             file_type.select(
                 on_select_filetype,
@@ -706,9 +1009,46 @@ with gr.Blocks(
                 ),
             )
 
-        with gr.Column(scale=2):
-            gr.Markdown("## Preview")
-            preview = PDF(label="Document Preview", visible=True, height=2000)
+        with gr.Column(scale=2, elem_classes=["panel", "panel-right"]):
+            preview_section_title = gr.Markdown("## " + t("preview_section"))
+            preview = PDF(label=t("preview_section"), visible=True, height=2000)
+
+    # Bind language change after all components are created (so outputs exist)
+    language_selector.change(
+        on_language_change,
+        inputs=language_selector,
+        outputs=[
+            header_md,
+            file_section_title,
+            file_type,
+            option_section_title,
+            experimental_title,
+            service,
+            lang_from,
+            lang_to,
+            page_range,
+            page_input,
+            more_options_acc,
+            threads,
+            skip_subset_fonts,
+            ignore_cache,
+            vfont,
+            prompt,
+            use_babeldoc,
+            file_input,
+            link_input,
+            output_title,
+            output_file_mono,
+            output_file_dual,
+            recaptcha_response,
+            language_selector,
+            translate_btn,
+            cancellation_btn,
+            tech_details_tog,
+            preview_section_title,
+            preview,
+        ],
+    )
 
     # Event handlers
     file_input.upload(
@@ -749,6 +1089,8 @@ with gr.Blocks(
             threads,
             skip_subset_fonts,
             ignore_cache,
+            translate_table_text,
+            no_watermark,
             vfont,
             use_babeldoc,
             recaptcha_response,

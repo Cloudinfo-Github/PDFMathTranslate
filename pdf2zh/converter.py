@@ -13,7 +13,7 @@ from pdfminer.pdffont import PDFCIDFont, PDFUnicodeNotDefined
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
 from pdfminer.utils import apply_matrix_pt, mult_matrix
 from pymupdf import Font
-from tenacity import retry, wait_fixed
+from tenacity import retry, wait_fixed, stop_after_attempt
 
 from pdf2zh.translator import (
     AnythingLLMTranslator,
@@ -344,7 +344,7 @@ class TranslateConverter(PDFConverterEx):
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
 
-        @retry(wait=wait_fixed(1))
+        @retry(wait=wait_fixed(1), stop=stop_after_attempt(5))
         def worker(s: str):  # 多线程翻译
             if not s.strip() or re.match(r"^\{v\d+\}$", s):  # 空白和公式不翻译
                 return s
@@ -357,10 +357,19 @@ class TranslateConverter(PDFConverterEx):
                 else:
                     log.exception(e, exc_info=False)
                 raise e
+
+        def safe_worker(s: str):
+            """Wrapper to catch exceptions and return original text as fallback"""
+            try:
+                return worker(s)
+            except Exception as e:
+                log.error(f"Translation failed after retries, using original text. Error: {e}")
+                return s  # Return original text as fallback
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.thread
         ) as executor:
-            news = list(executor.map(worker, sstk))
+            news = list(executor.map(safe_worker, sstk))
 
         ############################################################
         # C. 新文档排版

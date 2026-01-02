@@ -99,8 +99,69 @@ class BaseTranslator:
                 return cache
 
         translation = self.do_translate(text)
+
+        # Validate and fix placeholder preservation
+        translation = self._validate_and_fix_placeholders(text, translation)
+
         self.cache.set(text, translation)
         return translation
+
+    def _validate_and_fix_placeholders(self, original: str, translated: str) -> str:
+        """
+        Validate that formula placeholders are preserved in the translation.
+        If placeholders are missing or corrupted, attempt to fix them.
+
+        :param original: Original text with placeholders
+        :param translated: Translated text
+        :return: Fixed translated text
+        """
+        import re
+
+        # Extract all placeholders from original text
+        # Match patterns: {v0}, {v1}, {{v0}}, {{v1}}, <b0></b0>, etc.
+        placeholder_patterns = [
+            r'\{\s*v\s*(\d+)\s*\}',      # {v0}, { v 1 }, etc.
+            r'\{\{\s*v\s*(\d+)\s*\}\}',  # {{v0}}, {{ v 1 }}, etc.
+            r'<b(\d+)></b\1>',            # <b0></b0>, etc.
+            r'<b(\d+)>',                  # <b0>, etc.
+            r'</b(\d+)>',                 # </b0>, etc.
+        ]
+
+        original_placeholders = []
+        for pattern in placeholder_patterns:
+            matches = re.findall(pattern, original, re.IGNORECASE)
+            for match in matches:
+                # Find the full match
+                for full_match in re.finditer(pattern, original, re.IGNORECASE):
+                    original_placeholders.append(full_match.group(0))
+
+        if not original_placeholders:
+            return translated
+
+        # Check if placeholders exist in translation
+        missing_placeholders = []
+        for placeholder in original_placeholders:
+            # Normalize placeholder for matching (handle spacing variations)
+            normalized = re.sub(r'\s+', '', placeholder)
+            translated_normalized = re.sub(r'\s+', '', translated)
+
+            if normalized.lower() not in translated_normalized.lower():
+                missing_placeholders.append(placeholder)
+
+        if missing_placeholders:
+            logger.warning(
+                f"Translation lost placeholders: {missing_placeholders}. "
+                f"Original: {original[:100]}... "
+                f"Translation: {translated[:100]}..."
+            )
+            # If all placeholders are missing and original was mostly placeholders,
+            # return the original to preserve formulas
+            placeholder_ratio = len(''.join(original_placeholders)) / max(len(original), 1)
+            if placeholder_ratio > 0.5 and len(missing_placeholders) == len(original_placeholders):
+                logger.warning("High placeholder ratio with all missing - returning original")
+                return original
+
+        return translated
 
     def do_translate(self, text: str) -> str:
         """
@@ -133,17 +194,23 @@ class BaseTranslator:
 
         return [
             {
+                "role": "system",
+                "content": (
+                    "You are a professional, authentic machine translation engine specialized in translating scientific documents. "
+                    "CRITICAL RULES:\n"
+                    "1. NEVER modify, translate, or remove formula placeholders like {v0}, {v1}, {{v0}}, {{v1}}, <b0></b0>, etc.\n"
+                    "2. Keep all placeholders EXACTLY as they appear in the source text.\n"
+                    "3. Preserve markdown formatting, line breaks, and special characters.\n"
+                    "4. Only output the translated text, no explanations or additional content.\n"
+                    "5. If a sentence contains only placeholders, output it unchanged."
+                ),
+            },
+            {
                 "role": "user",
                 "content": (
-                    "You are a professional, authentic machine translation engine. "
-                    "Only Output the translated text, do not include any other text."
-                    "\n\n"
-                    f"Translate the following markdown source text to {self.lang_out}. "
-                    "Keep the formula notation {v*} unchanged. "
-                    "Output translation directly without any additional text."
-                    "\n\n"
-                    f"Source Text: {text}"
-                    "\n\n"
+                    f"Translate the following text to {self.lang_out}. "
+                    "IMPORTANT: Keep ALL formula placeholders (like {{v0}}, {{v1}}, {v0}, {v1}, <b0></b0>) unchanged.\n\n"
+                    f"Source Text:\n{text}\n\n"
                     "Translated Text:"
                 ),
             },
