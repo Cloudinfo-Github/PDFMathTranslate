@@ -56,8 +56,9 @@ def patch_paragraph_finder():
     # Problem: DocLayout-YOLO may classify text as "figure", "table", etc.
     # These get skipped, causing options/answers to be untranslated.
     # Solution: Allow ALL layouts that might contain text, only exclude pure images.
-    simple_old = 'return layout is not None and layout.name in ['
-    simple_new = '''# PATCHED: Treat None layout as plain text, and expand allowed types
+    # Use regex to match the entire return statement including the list
+    is_text_layout_pattern = r'return layout is not None and layout\.name in \[\s*\n\s*"plain text",\s*\n\s*"tiny text",\s*\n\s*"title",\s*\n\s*"abandon",\s*\n\s*"figure_caption",\s*\n\s*"table_caption",\s*\n\s*"table_text",\s*\n\s*\]'
+    is_text_layout_replacement = '''# PATCHED: Treat None layout as plain text, and expand allowed types
         if layout is None:
             return True
         # PATCHED: Allow almost all layout types that might contain text
@@ -65,13 +66,12 @@ def patch_paragraph_finder():
         excluded_layouts = ["figure"]  # Only pure images should be excluded
         if layout.name in excluded_layouts:
             return False
-        return True  # Allow all other layouts (including table, formula, etc.)
-        # Original check (kept for reference):
-        # return layout.name in ['''
+        return True  # Allow all other layouts (including table, formula, etc.)'''
 
-    if simple_old in content:
-        content = content.replace(simple_old, simple_new)
-        print("Patched is_text_layout method (expanded layout types)")
+    new_content, count = re.subn(is_text_layout_pattern, is_text_layout_replacement, content)
+    if count > 0:
+        content = new_content
+        print(f"Patched is_text_layout method (expanded layout types) - {count} replacement(s)")
         patched = True
 
     # Patch 2: Fix layout_label=current_layout.name when current_layout is None
