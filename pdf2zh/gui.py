@@ -458,6 +458,16 @@ def babeldoc_translate_file(**kwargs):
         # Determine watermark output mode
         watermark_mode = WatermarkOutputMode.NoWatermark if kwargs.get("no_watermark", True) else WatermarkOutputMode.Watermarked
 
+        # Check if translator is LLM-based (supports rich text translation)
+        is_llm_translator = isinstance(translator, (OpenAITranslator, AzureOpenAITranslator, OllamaTranslator, GeminiTranslator, ZhipuTranslator, ModelScopeTranslator, SiliconTranslator, DeepseekTranslator, GroqTranslator, GrokTranslator, OpenAIlikedTranslator, QwenMtTranslator, X302AITranslator))
+
+        # ============================================================
+        # BabelDOC Configuration - Optimized based on community best practices
+        # References:
+        # - https://github.com/funstory-ai/BabelDOC
+        # - https://funstory-ai.github.io/BabelDOC/
+        # - GitHub Issues #89, #254, #369
+        # ============================================================
         yadt_config = YadtConfig(
             input_file=file,
             font=None,
@@ -472,11 +482,50 @@ def babeldoc_translate_file(**kwargs):
             no_mono=False,
             qps=kwargs["thread"],
             use_rich_pbar=False,
-            disable_rich_text_translate=not isinstance(translator, OpenAITranslator),
+
+            # ============ Rich Text Translation ============
+            # For LLM translators (OpenAI, Azure, DeepSeek, etc.):
+            #   - Keep rich text enabled for better translation quality
+            # For traditional translators (Google, Bing, DeepL):
+            #   - Disable rich text for compatibility
+            disable_rich_text_translate=not is_llm_translator,
+
+            # ============ Font & Cleanup ============
             skip_clean=kwargs["skip_subset_fonts"],
+
+            # ============ Progress Reporting ============
             report_interval=0.5,
+
+            # ============ Table Processing ============
             table_model=table_model,
+
+            # ============ Watermark ============
             watermark_output_mode=watermark_mode,
+
+            # ============ Paragraph Detection Optimization ============
+            # min_text_length: Set to 1 to ensure all text blocks are translated
+            # (Default is 5, which may skip short titles or labels)
+            min_text_length=1,
+
+            # split_short_lines: MUST be False to prevent word splitting
+            # When True, may cause "What practices" to split into "What prac" + "tices"
+            split_short_lines=False,
+
+            # short_line_split_factor: Controls paragraph splitting sensitivity
+            # Lower value = less aggressive splitting = fewer split words
+            # Default: 0.8, Optimized: 0.5 to reduce false paragraph breaks
+            short_line_split_factor=0.5,
+
+            # ============ Translation Quality ============
+            # dual_translate_first: Translate dual (bilingual) version first
+            # This improves translation quality for the mono version
+            dual_translate_first=True,
+
+            # ============ Compatibility ============
+            # Note: enhance_compatibility enables skip_clean, dual_translate_first,
+            # AND disable_rich_text_translate. We set individual options instead
+            # to maintain rich text for LLM translators.
+            # enhance_compatibility=False (not set, using individual options)
         )
 
         async def yadt_translate_coro(yadt_config):

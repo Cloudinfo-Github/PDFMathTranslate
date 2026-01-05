@@ -14,11 +14,18 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # Network timeout settings for babeldoc font downloads
-      - HTTPX_TIMEOUT=120
+      - HTTPX_TIMEOUT=300
+      # Increase connection timeout
+      - REQUESTS_TIMEOUT=300
       # Uncomment and set these if you need a proxy for network access
       # - HTTP_PROXY=http://host.docker.internal:7890
       # - HTTPS_PROXY=http://host.docker.internal:7890
       # - NO_PROXY=localhost,127.0.0.1
+
+    # Add DNS settings for better network connectivity
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
       # The UV_LINK_MODE warning happens during build, so we can set it there if needed,
       # but it's generally harmless.
 
@@ -27,6 +34,7 @@ services:
     # Mount volumes for persistent data
     volumes:
       - pdf2zh-config:/root/.config/PDFMathTranslate
+      - babeldoc-cache:/root/.cache/babeldoc
       - ./data:/app/data
 
     gpus: all
@@ -36,3 +44,4 @@ services:
 
 volumes:
   pdf2zh-config:
+  babeldoc-cache:
