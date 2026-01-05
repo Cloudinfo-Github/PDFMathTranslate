@@ -545,7 +545,9 @@ class OpenAITranslator(BaseTranslator):
         return self.get_formular_placeholder(id + 1)
 
 
-class AzureOpenAITranslator(BaseTranslator):
+class AzureOpenAITranslator(OpenAITranslator):
+    # Inherits from OpenAITranslator to use the same placeholder format ({{v0}}, {{v1}})
+    # and processing logic (think_filter_regex, retry on rate limit)
     name = "azure-openai"
     envs = {
         "AZURE_OPENAI_BASE_URL": None,  # e.g. "https://xxx.openai.azure.com"
@@ -567,16 +569,19 @@ class AzureOpenAITranslator(BaseTranslator):
         ignore_cache=False,
     ):
         self.set_envs(envs)
-        base_url = self.envs["AZURE_OPENAI_BASE_URL"]
+        azure_base_url = self.envs["AZURE_OPENAI_BASE_URL"]
         if not model:
             model = self.envs["AZURE_OPENAI_MODEL"]
         api_version = self.envs.get("AZURE_OPENAI_API_VERSION", "2024-06-01")
         if api_key is None:
             api_key = self.envs["AZURE_OPENAI_API_KEY"]
-        super().__init__(lang_in, lang_out, model, ignore_cache)
+
+        # Call BaseTranslator.__init__ directly (skip OpenAITranslator.__init__)
+        BaseTranslator.__init__(self, lang_in, lang_out, model, ignore_cache)
+
         self.options = {"temperature": 0}
         self.client = openai.AzureOpenAI(
-            azure_endpoint=base_url,
+            azure_endpoint=azure_base_url,
             azure_deployment=model,
             api_version=api_version,
             api_key=api_key,
@@ -585,13 +590,13 @@ class AzureOpenAITranslator(BaseTranslator):
         self.add_cache_impact_parameters("temperature", self.options["temperature"])
         self.add_cache_impact_parameters("prompt", self.prompt("", self.prompttext))
 
-    def do_translate(self, text) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            **self.options,
-            messages=self.prompt(text, self.prompttext),
-        )
-        return response.choices[0].message.content.strip()
+        # Add think_filter_regex like OpenAITranslator
+        think_filter_regex = r"^<think>.+?\n*(</think>|\n)*(</think>)\n*"
+        self.add_cache_impact_parameters("think_filter_regex", think_filter_regex)
+        self.think_filter_regex = re.compile(think_filter_regex, flags=re.DOTALL)
+
+    # Inherit do_translate from OpenAITranslator (with retry and think_filter)
+    # Inherit get_formular_placeholder, get_rich_text_left_placeholder, get_rich_text_right_placeholder from OpenAITranslator
 
 
 class ModelScopeTranslator(OpenAITranslator):
