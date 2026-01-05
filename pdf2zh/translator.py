@@ -192,6 +192,18 @@ class BaseTranslator:
         except Exception:
             logging.exception("Error parsing prompt, use the default prompt.")
 
+        # Determine if target language is Traditional Chinese (Taiwan)
+        is_taiwan_chinese = self.lang_out.lower() in ["zh-tw", "zh-hant", "traditional chinese", "繁體中文"]
+
+        taiwan_instruction = ""
+        if is_taiwan_chinese:
+            taiwan_instruction = (
+                "6. Use Taiwan Traditional Chinese (台灣繁體中文) vocabulary and expressions.\n"
+                "7. Use Taiwan-specific terminology: 軟體(not 軟件), 程式(not 程序), 資料(not 數據), "
+                "網路(not 網絡), 視訊(not 視頻), 印表機(not 打印機), 滑鼠(not 鼠標), "
+                "硬碟(not 硬盤), 記憶體(not 內存), 伺服器(not 服務器), 檔案(not 文件).\n"
+            )
+
         return [
             {
                 "role": "system",
@@ -202,7 +214,8 @@ class BaseTranslator:
                     "2. Keep all placeholders EXACTLY as they appear in the source text.\n"
                     "3. Preserve markdown formatting, line breaks, and special characters.\n"
                     "4. Only output the translated text, no explanations or additional content.\n"
-                    "5. If a sentence contains only placeholders, output it unchanged."
+                    "5. If a sentence contains only placeholders, output it unchanged.\n"
+                    f"{taiwan_instruction}"
                 ),
             },
             {
