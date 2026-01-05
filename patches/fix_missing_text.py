@@ -4,16 +4,24 @@ BabelDOC patch to fix missing text issue.
 
 Problem: When DocLayout-YOLO fails to recognize certain text regions,
 characters that fall outside detected layout areas are skipped entirely.
+Additionally, text classified as non-text layouts (figure, table, etc.)
+may also be skipped even when they contain translatable content.
 
 Solution:
-1. Modify is_text_layout() to treat None layout as "plain text"
+1. Modify is_text_layout() to:
+   - Treat None layout as "plain text"
+   - Allow almost ALL layout types (only exclude pure "figure")
+   - This ensures options/answers in various layouts get translated
 2. Handle None layout when accessing layout.name in create_paragraphs()
+3. Fix paragraph splitting to keep same-line characters together
+4. Fix xobj_id splitting for same-line characters
 
 This is a known limitation of layout-based translation systems where
 the layout detection model may not capture all text regions, especially:
 - Text near page edges
 - Text with unusual formatting (e.g., numbered items like "NO.1")
 - Text that spans across detected region boundaries
+- Text in options/answers that may be classified as "table" or other types
 """
 
 import sys
@@ -44,16 +52,26 @@ def patch_paragraph_finder():
 
     patched = False
 
-    # Patch 1: Fix is_text_layout method
+    # Patch 1: Fix is_text_layout method - EXPANDED to include more layout types
+    # Problem: DocLayout-YOLO may classify text as "figure", "table", etc.
+    # These get skipped, causing options/answers to be untranslated.
+    # Solution: Allow ALL layouts that might contain text, only exclude pure images.
     simple_old = 'return layout is not None and layout.name in ['
-    simple_new = '''# PATCHED: Treat None layout as plain text
+    simple_new = '''# PATCHED: Treat None layout as plain text, and expand allowed types
         if layout is None:
             return True
-        return layout.name in ['''
+        # PATCHED: Allow almost all layout types that might contain text
+        # Only exclude layouts that are purely visual (no text content)
+        excluded_layouts = ["figure"]  # Only pure images should be excluded
+        if layout.name in excluded_layouts:
+            return False
+        return True  # Allow all other layouts (including table, formula, etc.)
+        # Original check (kept for reference):
+        # return layout.name in ['''
 
     if simple_old in content:
         content = content.replace(simple_old, simple_new)
-        print("Patched is_text_layout method")
+        print("Patched is_text_layout method (expanded layout types)")
         patched = True
 
     # Patch 2: Fix layout_label=current_layout.name when current_layout is None
