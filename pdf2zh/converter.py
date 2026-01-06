@@ -146,6 +146,8 @@ class TranslateConverter(PDFConverterEx):
         ignore_cache: bool = False,
     ) -> None:
         super().__init__(rsrcmgr)
+        self.lang_in = lang_in
+        self.lang_out = lang_out
         self.vfont = vfont
         self.vchar = vchar
         self.thread = thread
@@ -153,6 +155,8 @@ class TranslateConverter(PDFConverterEx):
         self.noto_name = noto_name
         self.noto = noto
         self.translator: BaseTranslator = None
+        self._fallback_google = None
+        self._google_fallback_unavailable = False
         # e.g. "ollama:gemma2:9b" -> ["ollama", "gemma2:9b"]
         param = service.split(":", 1)
         service_name = param[0]
@@ -343,6 +347,7 @@ class TranslateConverter(PDFConverterEx):
         ############################################################
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
+        fallback_count = 0
 
         @retry(wait=wait_fixed(1), stop=stop_after_attempt(5))
         def worker(s: str):  # 多线程翻译
@@ -360,16 +365,33 @@ class TranslateConverter(PDFConverterEx):
 
         def safe_worker(s: str):
             """Wrapper to catch exceptions and return original text as fallback"""
+            nonlocal fallback_count
             try:
                 return worker(s)
             except Exception as e:
-                log.error(f"Translation failed after retries, using original text. Error: {e}")
+                preview = s[:100].replace('\n', ' ')
+                log.warning(f"Primary translation failed for segment: '{preview}...'")
+                log.error(f"Translation error details: {e}")
+                if self._should_use_google_fallback(e):
+                    log.info(f"Content filter detected, attempting Google fallback...")
+                    fallback_text = self._translate_with_google_fallback(s)
+                    if fallback_text is not None:
+                        fallback_count += 1
+                        log.info(f"✓ Google fallback succeeded for segment (preview): '{preview}...'")
+                        return fallback_text
+                    else:
+                        log.error(f"✗ Google fallback failed, keeping original text: '{preview}...'")
+                else:
+                    log.error(f"Not a content filter error, keeping original text: '{preview}...'")
                 return s  # Return original text as fallback
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.thread
         ) as executor:
             news = list(executor.map(safe_worker, sstk))
+        
+        if fallback_count > 0:
+            log.warning(f"\n{'='*60}\nGoogle fallback was used {fallback_count} time(s) due to content filtering.\n{'='*60}\n")
 
         ############################################################
         # C. 新文档排版
@@ -535,6 +557,58 @@ class TranslateConverter(PDFConverterEx):
 
         ops = f"BT {''.join(ops_list)}ET "
         return ops
+
+    def _should_use_google_fallback(self, exc: Exception) -> bool:
+        if self.translator is None or self.translator.name == GoogleTranslator.name:
+            return False
+        return self._is_content_filter_error(exc)
+
+    def _is_content_filter_error(self, exc: Exception) -> bool:
+        message_parts = []
+        for attr in ("code", "status", "message"):
+            value = getattr(exc, attr, None)
+            if value:
+                message_parts.append(str(value))
+        if hasattr(exc, "error"):
+            error_obj = getattr(exc, "error")
+            code = getattr(error_obj, "code", None)
+            if code:
+                message_parts.append(str(code))
+            msg = getattr(error_obj, "message", None)
+            if msg:
+                message_parts.append(str(msg))
+        message_parts.append(str(exc))
+        message = " ".join(message_parts).lower()
+        return "content_filter" in message or "content filter" in message or "content management policy" in message
+
+    def _translate_with_google_fallback(self, text: str) -> str | None:
+        translator = self._get_google_fallback_translator()
+        if translator is None:
+            log.error("Cannot initialize Google fallback translator")
+            return None
+        try:
+            result = translator.translate(text, ignore_cache=True)
+            return result
+        except Exception as fallback_exc:
+            log.error(f"Google fallback translator exception: {fallback_exc}")
+            return None
+
+    def _get_google_fallback_translator(self):
+        if self._google_fallback_unavailable:
+            return None
+        if self._fallback_google is None:
+            try:
+                self._fallback_google = GoogleTranslator(
+                    self.lang_in,
+                    self.lang_out,
+                    None,
+                    ignore_cache=True,
+                )
+            except Exception as exc:
+                log.error(f"Failed to initialize Google fallback translator: {exc}")
+                self._google_fallback_unavailable = True
+                return None
+        return self._fallback_google
 
 
 class OpType(Enum):

@@ -208,23 +208,24 @@ class BaseTranslator:
             {
                 "role": "system",
                 "content": (
-                    "You are a professional, authentic machine translation engine specialized in translating scientific documents. "
-                    "CRITICAL RULES:\n"
-                    "1. NEVER modify, translate, or remove formula placeholders like {v0}, {v1}, {{v0}}, {{v1}}, <b0></b0>, etc.\n"
-                    "2. Keep all placeholders EXACTLY as they appear in the source text.\n"
+                    "You are a professional translator. "
+                    "Translate all text to the target language accurately and completely.\n\n"
+                    "Guidelines:\n"
+                    "1. Translate all English text to the target language.\n"
+                    "2. Keep formula placeholders like {v0}, {v1}, {{v0}}, {{v1}}, <b0></b0> unchanged.\n"
                     "3. Preserve markdown formatting, line breaks, and special characters.\n"
-                    "4. Only output the translated text, no explanations or additional content.\n"
-                    "5. If a sentence contains only placeholders, output it unchanged.\n"
+                    "4. Output only the translated text without explanations.\n"
+                    "5. If a sentence contains only placeholders, output it as-is.\n"
                     f"{taiwan_instruction}"
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Translate the following text to {self.lang_out}. "
-                    "IMPORTANT: Keep ALL formula placeholders (like {{v0}}, {{v1}}, {v0}, {v1}, <b0></b0>) unchanged.\n\n"
-                    f"Source Text:\n{text}\n\n"
-                    "Translated Text:"
+                    f"Translate the following English text to {self.lang_out}. "
+                    "Keep formula placeholders unchanged.\n\n"
+                    f"English:\n{text}\n\n"
+                    f"{self.lang_out}:"
                 ),
             },
         ]
@@ -523,16 +524,31 @@ class OpenAITranslator(BaseTranslator):
         ),
     )
     def do_translate(self, text) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            **self.options,
-            messages=self.prompt(text, self.prompttext),
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                **self.options,
+                messages=self.prompt(text, self.prompttext),
+            )
+        except openai.BadRequestError as e:
+            error_message = str(e)
+            if "content_filter" in error_message.lower() or "jailbreak" in error_message.lower() or "content management policy" in error_message.lower():
+                raise RuntimeError(f"content_filter: {error_message}")
+            raise
         if not response.choices:
             if hasattr(response, "error"):
                 raise ValueError("Error response from Service", response.error)
-        content = response.choices[0].message.content.strip()
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason == "content_filter":
+            raise RuntimeError("content_filter: response blocked by provider")
+        message_content = getattr(choice.message, "content", "")
+        content = (message_content or "").strip()
+        if not content and finish_reason in {"stop", None}:
+            raise RuntimeError("content_filter: empty response from provider")
         content = self.think_filter_regex.sub("", content).strip()
+        if not content:
+            raise RuntimeError("content_filter: stripped response empty")
         return content
 
     def get_formular_placeholder(self, id: int):
@@ -548,6 +564,7 @@ class OpenAITranslator(BaseTranslator):
 class AzureOpenAITranslator(OpenAITranslator):
     # Inherits from OpenAITranslator to use the same placeholder format ({{v0}}, {{v1}})
     # and processing logic (think_filter_regex, retry on rate limit)
+    # Added: Automatic Google Translate fallback for Azure content filter blocks
     name = "azure-openai"
     envs = {
         "AZURE_OPENAI_BASE_URL": None,  # e.g. "https://xxx.openai.azure.com"
@@ -595,8 +612,136 @@ class AzureOpenAITranslator(OpenAITranslator):
         self.add_cache_impact_parameters("think_filter_regex", think_filter_regex)
         self.think_filter_regex = re.compile(think_filter_regex, flags=re.DOTALL)
 
-    # Inherit do_translate from OpenAITranslator (with retry and think_filter)
-    # Inherit get_formular_placeholder, get_rich_text_left_placeholder, get_rich_text_right_placeholder from OpenAITranslator
+        # Google Translate fallback for content filter blocks
+        self._google_fallback = None
+        self._google_fallback_failed = False
+
+    def _get_google_fallback(self):
+        """Lazily initialize Google Translate fallback instance."""
+        if self._google_fallback is None and not self._google_fallback_failed:
+            try:
+                self._google_fallback = GoogleTranslator(
+                    self.lang_in, self.lang_out, "", ignore_cache=self.ignore_cache
+                )
+                logger.info("Google Translate fallback initialized for Azure content filter blocks")
+            except Exception as e:
+                self._google_fallback_failed = True
+                logger.warning(f"Failed to initialize Google Translate fallback: {e}")
+        return self._google_fallback
+
+    def _is_content_filter_error(self, error_message: str) -> bool:
+        """Check if the error is an Azure content filter error."""
+        keywords = ["content_filter", "jailbreak", "content management policy", 
+                    "responsible_ai_policy", "ResponsibleAIPolicyViolation"]
+        return any(kw.lower() in error_message.lower() for kw in keywords)
+
+    def _is_incomplete_translation(self, original: str, translated: str) -> bool:
+        """
+        Check if translation appears incomplete (e.g., trailing English words not translated).
+        This catches cases where Azure truncates or skips translating sentence endings.
+        """
+        import re
+        
+        # Extract the last word from original text (if it's an English word)
+        original_words = re.findall(r'[a-zA-Z]+', original)
+        if not original_words:
+            return False
+        
+        last_original_word = original_words[-1].lower()
+        
+        # Skip common words that might intentionally remain in English
+        skip_words = {'a', 'an', 'the', 'of', 'to', 'in', 'on', 'at', 'by', 'for', 'and', 'or', 
+                      'vs', 'ok', 'no', 'yes', 'id', 'api', 'url', 'http', 'https', 'www',
+                      'ai', 'ml', 'it', 'is', 'as', 'if', 'so', 'do', 'be', 'we', 'he', 'me'}
+        if last_original_word in skip_words or len(last_original_word) <= 2:
+            return False
+        
+        # Check if the translation ends with the same untranslated English word
+        translated_clean = translated.rstrip('.,!?;:。，！？；：')
+        translated_words = re.findall(r'[a-zA-Z]+', translated_clean)
+        
+        if translated_words:
+            last_translated_word = translated_words[-1].lower()
+            # If translation ends with the same English word as original, it's likely incomplete
+            if last_translated_word == last_original_word and len(last_original_word) > 3:
+                logger.warning(f"Incomplete translation detected: '{last_original_word}' not translated")
+                return True
+        
+        return False
+
+    @retry(
+        retry=retry_if_exception_type(openai.RateLimitError),
+        stop=stop_after_attempt(100),
+        wait=wait_exponential(multiplier=1, min=1, max=15),
+        before_sleep=lambda retry_state: logger.warning(
+            f"RateLimitError, retrying in {retry_state.next_action.sleep} seconds... "
+            f"(Attempt {retry_state.attempt_number}/100)"
+        ),
+    )
+    def do_translate(self, text) -> str:
+        """Translate text using Azure OpenAI, with automatic Google fallback for content filter blocks."""
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                **self.options,
+                messages=self.prompt(text, self.prompttext),
+            )
+            
+            if not response.choices:
+                if hasattr(response, "error"):
+                    raise ValueError("Error response from Service", response.error)
+            
+            choice = response.choices[0]
+            finish_reason = getattr(choice, "finish_reason", None)
+            
+            if finish_reason == "content_filter":
+                raise RuntimeError("content_filter: response blocked by provider")
+            
+            message_content = getattr(choice.message, "content", "")
+            content = (message_content or "").strip()
+            
+            if not content and finish_reason in {"stop", None}:
+                raise RuntimeError("content_filter: empty response from provider")
+            
+            content = self.think_filter_regex.sub("", content).strip()
+            if not content:
+                raise RuntimeError("content_filter: stripped response empty")
+            
+            # Check for incomplete translation (e.g., trailing words not translated)
+            if self._is_incomplete_translation(text, content):
+                logger.warning(f"Incomplete Azure translation detected, using Google fallback")
+                return self._fallback_to_google(text, "incomplete_translation: trailing words not translated")
+            
+            return content
+            
+        except openai.BadRequestError as e:
+            error_message = str(e)
+            if self._is_content_filter_error(error_message):
+                logger.warning(f"Azure content filter triggered, attempting Google fallback. Error: {error_message[:200]}")
+                return self._fallback_to_google(text, f"BadRequestError: {error_message}")
+            raise
+            
+        except RuntimeError as e:
+            error_message = str(e)
+            if "content_filter" in error_message.lower():
+                logger.warning(f"Azure content filter RuntimeError, attempting Google fallback. Error: {error_message[:200]}")
+                return self._fallback_to_google(text, error_message)
+            raise
+
+    def _fallback_to_google(self, text: str, original_error: str) -> str:
+        """Fallback to Google Translate when Azure content filter blocks the request."""
+        google = self._get_google_fallback()
+        if google is None:
+            logger.error(f"Google fallback unavailable. Original error: {original_error}")
+            raise RuntimeError(f"content_filter: {original_error} (Google fallback unavailable)")
+        
+        try:
+            result = google.do_translate(text)
+            logger.info(f"Google fallback successful for text: {text[:50]}...")
+            return result
+        except Exception as e:
+            logger.error(f"Google fallback failed: {e}. Original Azure error: {original_error}")
+            raise RuntimeError(f"content_filter: {original_error} (Google fallback failed: {e})")
 
 
 class ModelScopeTranslator(OpenAITranslator):
